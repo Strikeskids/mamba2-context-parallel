@@ -1,0 +1,27 @@
+Running into an error when trying to run the demo.py
+
+terminate called after throwing an instance of 'c10::Error'
+  what():  CUDA driver error: invalid argument
+Exception raised from ~AllocationRef at /pytorch/torch/csrc/distributed/c10d/symm_mem/CUDASymmetricMemory.cu:71 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x80 (0x7b8560d7cb80 in /home/ubuntu/gpumode/lib/python3.12/site-packages/torch/lib/libc10.so)
+frame #1: c10::detail::torchCheckFail(char const*, char const*, unsigned int, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&) + 0x65 (0x7b8560d0efbf in /home/ubuntu/gpumode/lib/python3.12/site-packages/torch/lib/libc10.so)
+frame #2: <unknown function> + 0xee2dc4 (0x7b84e6ee2dc4 in /home/ubuntu/gpumode/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #3: c10d::symmetric_memory::CUDASymmetricMemory::~CUDASymmetricMemory() + 0xc1 (0x7b84e6ee50c1 in /home/ubuntu/gpumode/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so)
+frame #4: <unknown function> + 0xdc69fc (0x7b8552bc69fc in /home/ubuntu/gpumode/lib/python3.12/site-packages/torch/lib/libtorch_python.so)
+frame #5: <unknown function> + 0x3bef8c (0x7b85521bef8c in /home/ubuntu/gpumode/lib/python3.12/site-packages/torch/lib/libtorch_python.so)
+frame #6: <unknown function> + 0x3bf61e (0x7b85521bf61e in /home/ubuntu/gpumode/lib/python3.12/site-packages/torch/lib/libtorch_python.so)
+frame #7: /home/ubuntu/gpumode/bin/python3() [0x572ffe]
+frame #8: _PyModule_Clear + 0x152 (0x583062 in /home/ubuntu/gpumode/bin/python3)
+frame #9: /home/ubuntu/gpumode/bin/python3() [0x6b1029]
+frame #10: Py_FinalizeEx + 0xad (0x6b04ad in /home/ubuntu/gpumode/bin/python3)
+frame #11: Py_RunMain + 0x281 (0x6bbe11 in /home/ubuntu/gpumode/bin/python3)
+frame #12: Py_BytesMain + 0x2d (0x6bba2d in /home/ubuntu/gpumode/bin/python3)
+frame #13: <unknown function> + 0x2a1ca (0x7b8561c2a1ca in /lib/x86_64-linux-gnu/libc.so.6)
+frame #14: __libc_start_main + 0x8b (0x7b8561c2a28b in /lib/x86_64-linux-gnu/libc.so.6)
+frame #15: _start + 0x25 (0x656a35 in /home/ubuntu/gpumode/bin/python3)
+
+This is in allocationref destructor. Seems to be an issue with cuMulticastUnbind
+
+https://github.com/pytorch/pytorch/issues/162429 => https://github.com/pytorch/pytorch/issues/150852#issuecomment-2795766064
+
+Points to this being fixed in NCCL 2.26.5
