@@ -23,6 +23,8 @@ print("Finished rdzv")
 
 peer_buf = hdl.get_buffer(next_rank, t.shape, t.dtype)
 
+print(symm_mem.get_backend(torch.cuda.current_device()))
+
 # Pull
 t.fill_(rank)
 hdl.barrier(channel=0)

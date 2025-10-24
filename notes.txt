@@ -25,3 +25,6 @@ This is in allocationref destructor. Seems to be an issue with cuMulticastUnbind
 https://github.com/pytorch/pytorch/issues/162429 => https://github.com/pytorch/pytorch/issues/150852#issuecomment-2795766064
 
 Points to this being fixed in NCCL 2.26.5
+
+Weird problem: the venv doesn't have pip
+Installed a new pip
