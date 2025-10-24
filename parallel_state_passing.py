@@ -142,6 +142,10 @@ def _state_passing_fwd_kernel(
         # load from the previous computed total state
         states = tl.load(state_comm_ptrs[1] + state_comm_offsets + comm_parity * stride_state_comm_db).to(tl.float32)
 
+    ptx_utils.symm_mem_sync(
+        signal_pad_ptrs, None, rank, WORLD_SIZE, hasPreviousMemAccess=True
+    )
+
     tl.store(out_ptrs, states, mask=offs_m < dim)
     out_ptrs += stride_out_chunk
 
