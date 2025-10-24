@@ -24,8 +24,9 @@ MIN_BLOCK_SIZE = 64
 @triton.jit
 def _state_passing_fwd_kernel(
     # Pointers to matrices
+    state_comm_ptrs,
     states_ptr, out_ptr, final_states_ptr, dA_cs_ptr, initstates_ptr, seq_idx_ptr,
-    signal_pad_ptrs, state_comm_ptrs, dA_comm_ptrs,
+    signal_pad_ptrs, dA_comm_ptrs,
     # Matrix dimensions
     dim, nchunks, seqlen, chunk_size,
     # Strides
@@ -38,7 +39,7 @@ def _state_passing_fwd_kernel(
     stride_state_comm_db, stride_state_comm_batch, stride_state_comm_head, stride_state_comm_dim,
     stride_dA_comm_db, stride_dA_comm_block, stride_dA_comm_batch, stride_dA_comm_head,
     # distributed parameters
-    rank,
+    rank: tl.constexpr,
     # Meta-parameters
     WORLD_SIZE_BITS: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
@@ -79,7 +80,7 @@ def _state_passing_fwd_kernel(
     # the update function is
     # (s1, a1) o (s2, a2) = (exp(a2) * s1 + s2, a1 + a2)
 
-    dA_sum = 0
+    dA_sum = tl.zeros((), dtype=tl.float32)
 
     # first, compute the final chunk value
     for c in range(nchunks):
@@ -95,29 +96,29 @@ def _state_passing_fwd_kernel(
         states_ptrs += stride_states_chunk
         dA_cs_ptr += stride_dA_cs_chunk
 
+    comm_parity = 0
     # store the local states at the end of the reduction to the communication buffer
     # we don't use a mask because this is intermediate data
-    tl.store(state_comm_ptrs[rank] + state_comm_offsets, states, mask=None)
-    tl.store(dA_comm_ptrs[rank] + dA_comm_offsets, dA_sum)
+
+    tl.store(state_comm_ptrs[0] + state_comm_offsets + comm_parity * stride_state_comm_db, states, mask=None)
+    tl.store(dA_comm_ptrs[0] + dA_comm_offsets + comm_parity * stride_dA_comm_db, dA_sum)
 
     ptx_utils.symm_mem_sync(
         signal_pad_ptrs, None, rank, WORLD_SIZE, hasSubsequentMemAccess=True
     )
 
-    comm_parity = 0
-
+    '''
     # then, do the parallel scan to reduce the values together
-    for prev_rank in tl.static_range(WORLD_SIZE_BITS):
+    for shift in tl.static_range(1, WORLD_SIZE_BITS + 1):
+        state_comm_ptr = state_comm_ptrs[shift]
         mask = offs_m < dim
-        peer_rank = rank - (1 << prev_rank)
-        if peer_rank < 0:
-            break
+        if state_comm_ptr is not None:
+            scale = tl.exp(dA_sum)
+            peer_states = tl.load(state_comm_ptr + state_comm_offsets + comm_parity * stride_state_comm_db)
 
-        scale = tl.exp(dA_sum)
-        peer_states = tl.load(state_comm_ptrs[peer_rank] + state_comm_offsets + comm_parity * stride_state_comm_db)
-        states = peer_states * scale + states
+            states = peer_states * scale + states
+            dA_sum += tl.load(dA_comm_ptrs[shift] + dA_comm_offsets + comm_parity * stride_dA_comm_db)
 
-        dA_sum += tl.load(dA_comm_ptrs[peer_rank] + dA_comm_offsets + comm_parity * stride_dA_comm_db)
         tl.store(state_comm_ptrs[rank] + state_comm_offsets + (1 - comm_parity) * stride_state_comm_db, states, mask=mask)
         tl.store(dA_comm_ptrs[rank] + dA_comm_offsets + (1 - comm_parity) * stride_dA_comm_db, dA_sum)
 
@@ -126,6 +127,7 @@ def _state_passing_fwd_kernel(
         )
 
         comm_parity = 1 - comm_parity
+    '''
 
     # finally, redo the chunk-wise computation to write the outputs
 
@@ -138,7 +140,7 @@ def _state_passing_fwd_kernel(
             states = tl.load(initstates_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
     else:
         # load from the previous computed total state
-        states = tl.load(state_comm_ptrs[rank - 1] + state_comm_offsets + comm_parity * stride_state_comm_db).to(tl.float32)
+        states = tl.load(state_comm_ptrs[1] + state_comm_offsets + comm_parity * stride_state_comm_db).to(tl.float32)
 
     tl.store(out_ptrs, states, mask=offs_m < dim)
     out_ptrs += stride_out_chunk
@@ -160,7 +162,7 @@ def _state_passing_fwd_kernel(
         dA_cs_ptr += stride_dA_cs_chunk
         out_ptrs += stride_out_chunk
 
-
+leaker = []
 
 def _state_passing_fwd_cp_dist(states, dA_chunk_cumsum, initial_states=None, out_dtype=None, group=None):
     batch, nchunks, nheads, dim = states.shape
@@ -179,40 +181,55 @@ def _state_passing_fwd_cp_dist(states, dA_chunk_cumsum, initial_states=None, out
 
     full_state_comm = symm_mem.empty(total_state_size, device=states.device, dtype=states.dtype)
     symm_mem_hdl = symm_mem.rendezvous(full_state_comm, group)
+    signal_pad_ptrs = symm_mem_hdl.signal_pad_ptrs_dev
 
+    rank = group.rank()
     world_size = group.size()
+    world_size_bits = math.ceil(math.log2(world_size))
+
+    # We cannot dynamically select the peer to consume from in the kernel, so we
+    # need to precommit to the list of peers before we enter the kernel
+    reduction_peers = [rank] + [ rank - (1 << i) for i in range(world_size_bits) ]
 
     state_comm_ptrs = tuple(
-        symm_mem_hdl.get_buffer(i, tuple(state_comm_shape), full_state_comm.dtype, offset=0)
-        for i in range(world_size)
+        symm_mem_hdl.get_buffer(i, tuple(state_comm_shape), full_state_comm.dtype, storage_offset=0)
+        if i >= 0 else None
+        for i in reduction_peers
     )
 
     dA_comm_ptrs = tuple(
-        symm_mem_hdl.get_buffer(i, tuple(dA_comm_shape), full_state_comm.dtype, offset=0)
-        for i in range(world_size)
+        symm_mem_hdl.get_buffer(i, tuple(dA_comm_shape), full_state_comm.dtype, storage_offset=torch.prod(torch.tensor(state_comm_shape)).item())
+        if i >= 0 else None
+        for i in reduction_peers
     )
+
+    if rank > 0:
+        assert state_comm_ptrs[1] is not None
 
     out = torch.empty((batch, nchunks, nheads, dim), device=states.device, dtype=out_dtype)
     final_states = torch.empty((batch, nheads, dim), device=states.device, dtype=torch.float32)
     grid = lambda META: (triton.cdiv(dim, META['BLOCK_SIZE']), batch, nheads)
     with torch.cuda.device(states.device.index):
         _state_passing_fwd_kernel[grid](
+            state_comm_ptrs,
             states, out, final_states, dA_chunk_cumsum, initial_states, None,
-            symm_mem_hdl.signal_pad_ptrs_dev, state_comm_ptrs,
+            signal_pad_ptrs,  dA_comm_ptrs,
             dim, nchunks,  0,  0,
             states.stride(0), states.stride(1), states.stride(2), states.stride(3),
             out.stride(0), out.stride(1), out.stride(2), out.stride(3),
             final_states.stride(0), final_states.stride(1), final_states.stride(2),
             dA_chunk_cumsum.stride(0), dA_chunk_cumsum.stride(2), dA_chunk_cumsum.stride(1),
-            *((initial_states.stride(0), initial_states.stride(1), initial_states.stride(2))
-              if initial_states is not None else (0, 0, 0)),
+            *((initial_states.stride(0), initial_states.stride(1), initial_states.stride(2)) if initial_states is not None else (0, 0, 0)),
             *(0, 0),
             state_comm_ptrs[0].stride(0), state_comm_ptrs[0].stride(1), state_comm_ptrs[0].stride(2), state_comm_ptrs[0].stride(3),
-            dA_comm_ptrs[0].stride(0), dA_comm_ptrs[0].stride(1), dA_comm_ptrs[0].stride(2),
+            dA_comm_ptrs[0].stride(0), dA_comm_ptrs[0].stride(1), dA_comm_ptrs[0].stride(2), dA_comm_ptrs[0].stride(3),
             rank=group.rank(), 
             WORLD_SIZE_BITS=math.ceil(math.log2(world_size)),
             WORLD_SIZE=world_size,
             HAS_INITSTATES=initial_states is not None,
         )
+
+    leaker.append((full_state_comm, symm_mem_hdl))
+
     return out, final_states
 

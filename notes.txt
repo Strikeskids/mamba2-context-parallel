@@ -28,3 +28,12 @@ Points to this being fixed in NCCL 2.26.5
 
 Weird problem: the venv doesn't have pip
 Installed a new pip
+
+
+Question: Can I use two separately-allocated tensors with the same pads?
+Question: Do I need to rendezvous twice on separate tensors?
+
+There is some nonsense around setting up the shared memory tensors that is kinda annoying
+
+We can't choose a rank that is dynamic inside the triton kernel, so we need to
+prefill the rank selection order in the kernel arguments
