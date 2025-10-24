@@ -82,6 +82,7 @@ def _state_passing_fwd_kernel(
 
     dA_sum = tl.zeros((), dtype=tl.float32)
 
+    '''
     # first, compute the final chunk value
     for c in range(nchunks):
         new_states = tl.load(states_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
@@ -95,6 +96,7 @@ def _state_passing_fwd_kernel(
         states = scale * states + new_states
         states_ptrs += stride_states_chunk
         dA_cs_ptr += stride_dA_cs_chunk
+    '''
 
     comm_parity = 0
     # store the local states at the end of the reduction to the communication buffer
@@ -146,6 +148,7 @@ def _state_passing_fwd_kernel(
         signal_pad_ptrs, None, rank, WORLD_SIZE, hasPreviousMemAccess=True
     )
 
+    '''
     tl.store(out_ptrs, states, mask=offs_m < dim)
     out_ptrs += stride_out_chunk
 
@@ -165,6 +168,7 @@ def _state_passing_fwd_kernel(
         states_ptrs += stride_states_chunk
         dA_cs_ptr += stride_dA_cs_chunk
         out_ptrs += stride_out_chunk
+    '''
 
 leaker = []
 

@@ -28,25 +28,35 @@ def ping_pong(
     # Synchronize blocks with matching block_id across all participating devices before starting.
     # This ensures that all previous memory operations are visible.
 
-    tl.store(buf_tuple[0], rank + 1)
+    off = tl.program_id(0)
+
+    tl.store(buf_tuple[0] + off, rank + 1)
 
     ptx_utils.symm_mem_sync(
         signal_pad_ptrs, None, rank, world_size, hasSubsequentMemAccess=True
     )
 
-    other = tl.load(buf_tuple[1])
+    if buf_tuple[1] is not None:
+        other = tl.load(buf_tuple[1] + off)
+    else:
+        other = 0
 
     ptx_utils.symm_mem_sync(
         signal_pad_ptrs, None, rank, world_size, hasSubsequentMemAccess=True, hasPreviousMemAccess=True,
     )
 
-    tl.store(buf_tuple[0], other + 10 * (rank + 1))
+    tl.store(buf_tuple[0] + off, other + 10 * (rank + 1))
 
     ptx_utils.symm_mem_sync(
         signal_pad_ptrs, None, rank, world_size, hasSubsequentMemAccess=True, hasPreviousMemAccess=True,
     )
 
-    final = tl.load(buf_tuple[1]) + 100 * (rank + 1)
+    if buf_tuple[1] is not None:
+        other = tl.load(buf_tuple[1] + off)
+    else:
+        other = 0
+
+    final = other + 100 * (rank + 1)
 
     # Synchronize all participating devices after the reduction is complete.
     # Subsequent kernel cannot overwrite the symmetric memory buffer until all devices reach this point.
@@ -54,24 +64,26 @@ def ping_pong(
         signal_pad_ptrs, None, rank, world_size, hasPreviousMemAccess=True
     )
 
-    tl.store(output_ptr, final)
+    tl.store(output_ptr + off, final)
 
 
 def one_shot_all_reduce(group) -> torch.Tensor:
-    tensor = symm_mem.empty(1, device='cuda', dtype=torch.int32)
+    NUM_BLOCKS = 100
+    tensor = symm_mem.empty(NUM_BLOCKS, device='cuda', dtype=torch.int32)
     symm_mem_hdl = symm_mem.rendezvous(tensor, group=group)
     output = torch.empty_like(tensor)
 
     # Get the buffer pointers for each rank from the symmetric memory handle, and pass them as a tuple to the triton kernel.
     buf_tuple = tuple(
-        symm_mem_hdl.get_buffer(group.rank() ^ i, tuple(tensor.shape), tensor.dtype)
+        symm_mem_hdl.get_buffer(group.rank() - i, tuple(tensor.shape), tensor.dtype) 
+        if i <= group.rank() else None
         for i in range(2)
     )
 
     # symm_mem_hdl.signal_pad_ptrs_dev: An array of pointers pointing to signal_pads for each rank.
     # A signal pad is a memory region used for synchronization between devices.
     # `symm_mem_sync` kernel uses these signal pads to implement a cross-device barrier to ensure memory visibility of symmetric memory tensors.
-    ping_pong[(1, 1, 1)](
+    ping_pong[(NUM_BLOCKS, 1, 1)](
         buf_tuple,
         symm_mem_hdl.signal_pad_ptrs_dev,
         output,
