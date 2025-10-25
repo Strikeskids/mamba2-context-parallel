@@ -68,7 +68,7 @@ def ping_pong(
 
 
 def one_shot_all_reduce(group) -> torch.Tensor:
-    NUM_BLOCKS = 100
+    NUM_BLOCKS = 100000
     tensor = symm_mem.empty(NUM_BLOCKS, device='cuda', dtype=torch.int32)
     symm_mem_hdl = symm_mem.rendezvous(tensor, group=group)
     output = torch.empty_like(tensor)

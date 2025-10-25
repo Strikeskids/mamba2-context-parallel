@@ -12,11 +12,11 @@ MIN_BLOCK_SIZE = 64
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_SIZE': 64}),
-        triton.Config({'BLOCK_SIZE': 128}),
-        triton.Config({'BLOCK_SIZE': 256}),
-        triton.Config({'BLOCK_SIZE': 512}),
-        triton.Config({'BLOCK_SIZE': 1024}),
+        # triton.Config({'BLOCK_SIZE': 64}),
+        # triton.Config({'BLOCK_SIZE': 128}),
+        # triton.Config({'BLOCK_SIZE': 256}),
+        # triton.Config({'BLOCK_SIZE': 512}),
+        # triton.Config({'BLOCK_SIZE': 1024}),
         triton.Config({'BLOCK_SIZE': 2048}),
     ],
     key=['dim'],
@@ -26,7 +26,8 @@ def _state_passing_fwd_kernel(
     # Pointers to matrices
     state_comm_ptrs,
     states_ptr, out_ptr, final_states_ptr, dA_cs_ptr, initstates_ptr, seq_idx_ptr,
-    signal_pad_ptrs, dA_comm_ptrs,
+    signal_pad_ptrs,
+    # dA_comm_ptrs,
     # Matrix dimensions
     dim, nchunks, seqlen, chunk_size,
     # Strides
@@ -37,7 +38,7 @@ def _state_passing_fwd_kernel(
     stride_initstates_batch, stride_initstates_head, stride_initstates_dim,
     stride_seq_idx_batch, stride_seq_idx_seqlen,
     stride_state_comm_db, stride_state_comm_batch, stride_state_comm_head, stride_state_comm_dim,
-    stride_dA_comm_db, stride_dA_comm_block, stride_dA_comm_batch, stride_dA_comm_head,
+    # stride_dA_comm_db, stride_dA_comm_block, stride_dA_comm_batch, stride_dA_comm_head,
     # distributed parameters
     rank: tl.constexpr,
     # Meta-parameters
@@ -46,6 +47,7 @@ def _state_passing_fwd_kernel(
     HAS_INITSTATES: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
+    '''
     pid_b = tl.program_id(axis=1)
     pid_h = tl.program_id(axis=2)
     pid_m = tl.program_id(axis=0)
@@ -56,7 +58,7 @@ def _state_passing_fwd_kernel(
     if HAS_INITSTATES:
         initstates_ptr += pid_b * stride_initstates_batch + pid_h * stride_initstates_head
     state_comm_offsets = pid_b * stride_state_comm_batch + pid_h * stride_state_comm_head
-    dA_comm_offsets = pid_b * stride_dA_comm_batch + pid_h * stride_dA_comm_head
+    # dA_comm_offsets = pid_b * stride_dA_comm_batch + pid_h * stride_dA_comm_head
 
     # if HAS_SEQ_IDX:
     #     seq_idx_ptr += pid_b * stride_seq_idx_batch
@@ -65,7 +67,7 @@ def _state_passing_fwd_kernel(
     states_ptrs = states_ptr + offs_m * stride_states_dim
     out_ptrs = out_ptr + offs_m * stride_out_dim
     final_states_ptrs = final_states_ptr + offs_m * stride_final_states_dim
-    dA_comm_offsets += pid_m * stride_dA_comm_block
+    # dA_comm_offsets += pid_m * stride_dA_comm_block
     state_comm_offsets += offs_m * stride_state_comm_dim
 
     if not HAS_INITSTATES:
@@ -82,7 +84,6 @@ def _state_passing_fwd_kernel(
 
     dA_sum = tl.zeros((), dtype=tl.float32)
 
-    '''
     # first, compute the final chunk value
     for c in range(nchunks):
         new_states = tl.load(states_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
@@ -96,14 +97,15 @@ def _state_passing_fwd_kernel(
         states = scale * states + new_states
         states_ptrs += stride_states_chunk
         dA_cs_ptr += stride_dA_cs_chunk
-    '''
 
     comm_parity = 0
     # store the local states at the end of the reduction to the communication buffer
     # we don't use a mask because this is intermediate data
 
     tl.store(state_comm_ptrs[0] + state_comm_offsets + comm_parity * stride_state_comm_db, states, mask=None)
-    tl.store(dA_comm_ptrs[0] + dA_comm_offsets + comm_parity * stride_dA_comm_db, dA_sum)
+    # tl.store(dA_comm_ptrs[0] + dA_comm_offsets + comm_parity * stride_dA_comm_db, dA_sum)
+
+    '''
 
     ptx_utils.symm_mem_sync(
         signal_pad_ptrs, None, rank, WORLD_SIZE, hasSubsequentMemAccess=True
@@ -133,6 +135,7 @@ def _state_passing_fwd_kernel(
 
     # finally, redo the chunk-wise computation to write the outputs
 
+    '''
     # load the state, either from initial states or from the communication buffer
     if rank == 0:
         if not HAS_INITSTATES:
@@ -143,10 +146,13 @@ def _state_passing_fwd_kernel(
     else:
         # load from the previous computed total state
         states = tl.load(state_comm_ptrs[1] + state_comm_offsets + comm_parity * stride_state_comm_db).to(tl.float32)
+    '''
 
+    '''
     ptx_utils.symm_mem_sync(
         signal_pad_ptrs, None, rank, WORLD_SIZE, hasPreviousMemAccess=True
     )
+    '''
 
     '''
     tl.store(out_ptrs, states, mask=offs_m < dim)
@@ -205,11 +211,11 @@ def _state_passing_fwd_cp_dist(states, dA_chunk_cumsum, initial_states=None, out
         for i in reduction_peers
     )
 
-    dA_comm_ptrs = tuple(
-        symm_mem_hdl.get_buffer(i, tuple(dA_comm_shape), full_state_comm.dtype, storage_offset=torch.prod(torch.tensor(state_comm_shape)).item())
-        if i >= 0 else None
-        for i in reduction_peers
-    )
+    # dA_comm_ptrs = tuple(
+    #     symm_mem_hdl.get_buffer(i, tuple(dA_comm_shape), full_state_comm.dtype, storage_offset=torch.prod(torch.tensor(state_comm_shape)).item())
+    #     if i >= 0 else None
+    #     for i in reduction_peers
+    # )
 
     if rank > 0:
         assert state_comm_ptrs[1] is not None
@@ -221,7 +227,8 @@ def _state_passing_fwd_cp_dist(states, dA_chunk_cumsum, initial_states=None, out
         _state_passing_fwd_kernel[grid](
             state_comm_ptrs,
             states, out, final_states, dA_chunk_cumsum, initial_states, None,
-            signal_pad_ptrs,  dA_comm_ptrs,
+            signal_pad_ptrs, 
+            # dA_comm_ptrs,
             dim, nchunks,  0,  0,
             states.stride(0), states.stride(1), states.stride(2), states.stride(3),
             out.stride(0), out.stride(1), out.stride(2), out.stride(3),
@@ -230,7 +237,7 @@ def _state_passing_fwd_cp_dist(states, dA_chunk_cumsum, initial_states=None, out
             *((initial_states.stride(0), initial_states.stride(1), initial_states.stride(2)) if initial_states is not None else (0, 0, 0)),
             *(0, 0),
             state_comm_ptrs[0].stride(0), state_comm_ptrs[0].stride(1), state_comm_ptrs[0].stride(2), state_comm_ptrs[0].stride(3),
-            dA_comm_ptrs[0].stride(0), dA_comm_ptrs[0].stride(1), dA_comm_ptrs[0].stride(2), dA_comm_ptrs[0].stride(3),
+            # dA_comm_ptrs[0].stride(0), dA_comm_ptrs[0].stride(1), dA_comm_ptrs[0].stride(2), dA_comm_ptrs[0].stride(3),
             rank=group.rank(), 
             WORLD_SIZE_BITS=math.ceil(math.log2(world_size)),
             WORLD_SIZE=world_size,

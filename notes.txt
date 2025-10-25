@@ -37,3 +37,16 @@ There is some nonsense around setting up the shared memory tensors that is kinda
 
 We can't choose a rank that is dynamic inside the triton kernel, so we need to
 prefill the rank selection order in the kernel arguments
+
+
+
+semaphore counter
+red.global.add.release.sys.u32 [addr], 1 =>> reduce global, give location + value => total 2
+ld.acquire important to do strong load
+
+alternatively, store into unique addresses per block
+
+nvshmem_barrier /warp/block
+
+NVSHMEM_IBGDA_ENABLE
++ transport uses IBGDA instead of IBRC
