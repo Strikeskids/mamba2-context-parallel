@@ -11,7 +11,7 @@ from kraken import _ptx_utils as ptx_utils
 MIN_BLOCK_SIZE = 64
 
 @triton.jit
-def _state_passing_fwd_kernel(
+def _state_passing_fwd_kernel_with_cp_dist(
     # Pointers to matrices
     state_comm_ptrs,
     states_ptr, out_ptr, final_states_ptr, dA_cs_ptr, initstates_ptr, seq_idx_ptr,
@@ -69,11 +69,11 @@ def _state_passing_fwd_kernel(
         initstates_ptrs = initstates_ptr + offs_m * stride_initstates_dim
         states = tl.load(initstates_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
 
-    # # seq_idx = 0
+    # seq_idx = 0
 
-    # # our monoid is over pairs (state, dA_sum)
-    # # the update function is
-    # # (s1, a1) o (s2, a2) = (exp(a2) * s1 + s2, a1 + a2)
+    # our monoid is over pairs (state, dA_sum)
+    # the update function is
+    # (s1, a1) o (s2, a2) = (exp(a2) * s1 + s2, a1 + a2)
 
     dA_sum = tl.zeros((), dtype=tl.float32)
 
@@ -94,7 +94,7 @@ def _state_passing_fwd_kernel(
     # store the local states at the end of the reduction to the communication buffer
     # we don't use a mask because this is intermediate data
 
-    tl.store(state_comm_ptrs[0] + state_comm_offsets + comm_parity * stride_state_comm_db, states, mask=None)
+    tl.store(state_comm_ptrs[0] + state_comm_offsets + comm_parity * stride_state_comm_db, states, mask=offs_m < dim)
     tl.store(dA_comm_ptrs[0] + dA_comm_offsets + comm_parity * stride_dA_comm_db, dA_sum)
 
     ptx_utils.symm_mem_sync(
@@ -104,16 +104,15 @@ def _state_passing_fwd_kernel(
     # then, do the parallel scan to reduce the values together
     for shift in tl.static_range(1, WORLD_SIZE_BITS + 1):
         state_comm_ptr = state_comm_ptrs[shift]
-        mask = offs_m < dim
         if state_comm_ptr is not None:
             scale = tl.exp(dA_sum)
-            peer_states = tl.load(state_comm_ptr + state_comm_offsets + comm_parity * stride_state_comm_db)
+            peer_states = tl.load(state_comm_ptr + state_comm_offsets + comm_parity * stride_state_comm_db, mask=offs_m < dim, other=0.0)
 
             states = peer_states * scale + states
             dA_sum += tl.load(dA_comm_ptrs[shift] + dA_comm_offsets + comm_parity * stride_dA_comm_db)
 
-        tl.store(state_comm_ptrs[rank] + state_comm_offsets + (1 - comm_parity) * stride_state_comm_db, states, mask=mask)
-        tl.store(dA_comm_ptrs[rank] + dA_comm_offsets + (1 - comm_parity) * stride_dA_comm_db, dA_sum)
+        tl.store(state_comm_ptrs[0] + state_comm_offsets + (1 - comm_parity) * stride_state_comm_db, states, mask=offs_m < dim)
+        tl.store(dA_comm_ptrs[0] + dA_comm_offsets + (1 - comm_parity) * stride_dA_comm_db, dA_sum)
 
         ptx_utils.symm_mem_sync(
             signal_pad_ptrs, None, rank, WORLD_SIZE, hasPreviousMemAccess=True, hasSubsequentMemAccess=True
@@ -132,7 +131,7 @@ def _state_passing_fwd_kernel(
             states = tl.load(initstates_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
     else:
         # load from the previous computed total state
-        states = tl.load(state_comm_ptrs[1] + state_comm_offsets + comm_parity * stride_state_comm_db).to(tl.float32)
+        states = tl.load(state_comm_ptrs[1] + state_comm_offsets + comm_parity * stride_state_comm_db, mask=offs_m < dim, other=0.0).to(tl.float32)
 
     ptx_utils.symm_mem_sync(
         signal_pad_ptrs, None, rank, WORLD_SIZE, hasPreviousMemAccess=True
@@ -207,12 +206,14 @@ def _state_passing_fwd_cp_dist(states, dA_chunk_cumsum, initial_states=None, out
 
     if rank > 0:
         assert state_comm_ptrs[1] is not None
+    else:
+        assert state_comm_ptrs[1] is None
 
     out = torch.empty((batch, nchunks, nheads, dim), device=states.device, dtype=out_dtype)
     final_states = torch.empty((batch, nheads, dim), device=states.device, dtype=torch.float32)
     grid = lambda META: (triton.cdiv(dim, META['BLOCK_SIZE']), batch, nheads)
     with torch.cuda.device(states.device.index):
-        _state_passing_fwd_kernel[grid](
+        _state_passing_fwd_kernel_with_cp_dist[grid](
             state_comm_ptrs,
             states, out, final_states, dA_chunk_cumsum, initial_states, None,
             signal_pad_ptrs, 

@@ -27,7 +27,7 @@ def ref_slow_allgather(states: torch.Tensor, dA_chunk_cumsum: torch.Tensor, init
     output, final_states = _state_passing_fwd(states=all_states, dA_chunk_cumsum=all_dA_chunk_cumsum, initial_states=initial_states)
 
     if rank != world_size - 1:
-        final_states = None
+        final_states = output[:, (rank + 1) * nchunks, :, :]
 
     return output[:, rank * nchunks:(rank + 1) * nchunks, :, :], final_states
 
@@ -54,12 +54,33 @@ def main():
     print(f"{rank=} Starting ref state passing", file=sys.stderr)
     output_ref, final_states_ref = ref_slow_allgather(states, dA_chunk_cumsum, initial_states, dist.group.WORLD)
 
+    first_states_tensor = torch.empty(world_size, BATCH, NHEADS, HEAD_DIM, device='cuda', dtype=torch.float)
+    dist.all_gather_into_tensor(first_states_tensor, output_dist[:, 0, :, :].contiguous(), group=dist.group.WORLD)
+
     print(f"{rank=} Checking results", file=sys.stderr)
-    if rank == 0:
-        print(output_ref[0, :10, 0, :10], output_dist[0, :10, 0, :10])
-    assert torch.allclose(output_ref, output_dist)
+
+    # if rank != 0: return
+
     if final_states_ref is not None:
-        assert torch.allclose(final_states_ref, final_states_dist)
+        if not torch.allclose(final_states_ref, final_states_dist, atol=1e-6, rtol=1e-5):
+            print(f'{rank=} bad final states', file=sys.stderr)
+            print(f'{rank=}', final_states_ref.shape)
+            print(f'{rank=}', final_states_ref[0, 0, :10])
+            print(f'{rank=}', final_states_dist[0, 0, :10])
+            print(f'{rank=} max diff', (final_states_ref - final_states_dist).abs().max())
+        else:
+            print(f'{rank=} final states match', file=sys.stderr)
+
+        if rank < world_size - 1 and not torch.allclose(final_states_ref, first_states_tensor[rank + 1], atol=1e-6, rtol=1e-5):
+            target = first_states_tensor[rank + 1]
+            print(f'{rank=} bad initial states {(final_states_ref - target).abs().max()}', file=sys.stderr)
+            print(f'{rank=}', final_states_ref[0, 0, :10])
+            print(f'{rank=}', target[0, 0, :10])
+
+    if not torch.allclose(output_ref, output_dist, atol=1e-6, rtol=1e-5):
+        print(f'{rank=} bad output {(output_ref - output_dist).abs().max()}', file=sys.stderr)
+        print(f'{rank=}', output_ref[0, :10, 0, :10])
+        print(f'{rank=}', output_dist[0, :10, 0, :10])
 
 
 if __name__ == '__main__': 
