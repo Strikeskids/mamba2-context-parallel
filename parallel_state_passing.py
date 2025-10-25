@@ -58,17 +58,22 @@ def _state_passing_fwd_kernel(
     dA_comm_offsets += pid_m * stride_dA_comm_block
     state_comm_offsets += offs_m * stride_state_comm_dim
 
+    initial_states_ptrs = states_ptrs
+    initial_dA_cs_ptr = dA_cs_ptr
+
+    comm_parity = 0
+
     if not HAS_INITSTATES:
         states = tl.zeros((BLOCK_SIZE, ), dtype=tl.float32)
     else:
         initstates_ptrs = initstates_ptr + offs_m * stride_initstates_dim
         states = tl.load(initstates_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
 
-    # seq_idx = 0
+    # # seq_idx = 0
 
-    # our monoid is over pairs (state, dA_sum)
-    # the update function is
-    # (s1, a1) o (s2, a2) = (exp(a2) * s1 + s2, a1 + a2)
+    # # our monoid is over pairs (state, dA_sum)
+    # # the update function is
+    # # (s1, a1) o (s2, a2) = (exp(a2) * s1 + s2, a1 + a2)
 
     dA_sum = tl.zeros((), dtype=tl.float32)
 
@@ -86,7 +91,6 @@ def _state_passing_fwd_kernel(
         states_ptrs += stride_states_chunk
         dA_cs_ptr += stride_dA_cs_chunk
 
-    comm_parity = 0
     # store the local states at the end of the reduction to the communication buffer
     # we don't use a mask because this is intermediate data
 
@@ -133,6 +137,9 @@ def _state_passing_fwd_kernel(
     ptx_utils.symm_mem_sync(
         signal_pad_ptrs, None, rank, WORLD_SIZE, hasPreviousMemAccess=True
     )
+
+    states_ptrs = initial_states_ptrs
+    dA_cs_ptr = initial_dA_cs_ptr
 
     tl.store(out_ptrs, states, mask=offs_m < dim)
     out_ptrs += stride_out_chunk

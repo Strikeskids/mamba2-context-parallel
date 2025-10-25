@@ -55,6 +55,8 @@ def main():
     output_ref, final_states_ref = ref_slow_allgather(states, dA_chunk_cumsum, initial_states, dist.group.WORLD)
 
     print(f"{rank=} Checking results", file=sys.stderr)
+    if rank == 0:
+        print(output_ref[0, :10, 0, :10], output_dist[0, :10, 0, :10])
     assert torch.allclose(output_ref, output_dist)
     if final_states_ref is not None:
         assert torch.allclose(final_states_ref, final_states_dist)
