@@ -10,6 +10,266 @@ from kraken import _ptx_utils as ptx_utils
 
 MIN_BLOCK_SIZE = 64
 
+
+@triton.jit
+def _state_passing_fwd_kernel_with_cp_dist(
+    # Pointers to matrices
+    state_comm_ptrs,
+    states_ptr, out_ptr, final_states_ptr, dA_cs_ptr, initstates_ptr, seq_idx_ptr,
+    signal_pad_ptrs,
+    dA_comm_ptrs,
+    # Matrix dimensions
+    dim, nchunks, seqlen, chunk_size,
+    # Strides
+    stride_states_batch, stride_states_chunk, stride_states_head, stride_states_dim,
+    stride_out_batch, stride_out_chunk, stride_out_head, stride_out_dim,
+    stride_final_states_batch, stride_final_states_head, stride_final_states_dim,
+    stride_dA_cs_batch, stride_dA_cs_chunk, stride_dA_cs_head,
+    stride_initstates_batch, stride_initstates_head, stride_initstates_dim,
+    stride_seq_idx_batch, stride_seq_idx_seqlen,
+    stride_state_comm_db, stride_state_comm_batch, stride_state_comm_head, stride_state_comm_dim,
+    stride_dA_comm_db, stride_dA_comm_block, stride_dA_comm_batch, stride_dA_comm_head,
+    # distributed parameters
+    rank: tl.constexpr,
+    # Meta-parameters
+    WORLD_SIZE_BITS: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
+    HAS_INITSTATES: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid_b = tl.program_id(axis=1)
+    pid_h = tl.program_id(axis=2)
+    pid_m = tl.program_id(axis=0)
+    states_ptr += pid_b * stride_states_batch + pid_h * stride_states_head
+    dA_cs_ptr += pid_b * stride_dA_cs_batch + pid_h * stride_dA_cs_head
+    out_ptr += pid_b * stride_out_batch + pid_h * stride_out_head
+    final_states_ptr += pid_b * stride_final_states_batch + pid_h * stride_final_states_head
+    if HAS_INITSTATES:
+        initstates_ptr += pid_b * stride_initstates_batch + pid_h * stride_initstates_head
+    state_comm_offsets = pid_b * stride_state_comm_batch + pid_h * stride_state_comm_head
+    dA_comm_offsets = pid_b * stride_dA_comm_batch + pid_h * stride_dA_comm_head
+
+    # if HAS_SEQ_IDX:
+    #     seq_idx_ptr += pid_b * stride_seq_idx_batch
+
+    offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    states_ptrs = states_ptr + offs_m * stride_states_dim
+    out_ptrs = out_ptr + offs_m * stride_out_dim
+    final_states_ptrs = final_states_ptr + offs_m * stride_final_states_dim
+    dA_comm_offsets += pid_m * stride_dA_comm_block
+    state_comm_offsets += offs_m * stride_state_comm_dim
+    initstates_ptrs = initstates_ptr + offs_m * stride_initstates_dim
+
+    states, dA_sum = _compute_final_states(states_ptrs, dA_cs_ptr, initstates_ptrs, offs_m, dim, nchunks, stride_states_chunk, stride_dA_cs_chunk, HAS_INITSTATES, BLOCK_SIZE)
+
+    # store the local states at the end of the reduction to the communication buffer
+    # we don't use a mask because this is intermediate data
+
+    comm_parity = 0
+
+    tl.store(state_comm_ptrs[0] + state_comm_offsets + comm_parity * stride_state_comm_db, states, mask=offs_m < dim)
+    tl.store(dA_comm_ptrs[0] + dA_comm_offsets + comm_parity * stride_dA_comm_db, dA_sum)
+
+    ptx_utils.symm_mem_sync(
+        signal_pad_ptrs, None, rank, WORLD_SIZE, hasSubsequentMemAccess=True
+    )
+
+    # then, do the parallel scan to reduce the values together
+    for shift in tl.static_range(1, WORLD_SIZE_BITS + 1):
+        state_comm_ptr = state_comm_ptrs[shift]
+        if state_comm_ptr is not None:
+            scale = tl.exp(dA_sum)
+            peer_states = tl.load(state_comm_ptr + state_comm_offsets + comm_parity * stride_state_comm_db, mask=offs_m < dim, other=0.0)
+
+            states = peer_states * scale + states
+            dA_sum += tl.load(dA_comm_ptrs[shift] + dA_comm_offsets + comm_parity * stride_dA_comm_db)
+
+        tl.store(state_comm_ptrs[0] + state_comm_offsets + (1 - comm_parity) * stride_state_comm_db, states, mask=offs_m < dim)
+        tl.store(dA_comm_ptrs[0] + dA_comm_offsets + (1 - comm_parity) * stride_dA_comm_db, dA_sum)
+
+        ptx_utils.symm_mem_sync(
+            signal_pad_ptrs, None, rank, WORLD_SIZE, hasPreviousMemAccess=True, hasSubsequentMemAccess=True
+        )
+
+        comm_parity = 1 - comm_parity
+
+    # finally, redo the chunk-wise computation to write the outputs
+
+    # load the state, either from initial states or from the communication buffer
+    if rank == 0:
+        if not HAS_INITSTATES:
+            states = tl.zeros((BLOCK_SIZE, ), dtype=tl.float32)
+        else:
+            initstates_ptrs = initstates_ptr + offs_m * stride_initstates_dim
+            states = tl.load(initstates_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
+    else:
+        # load from the previous computed total state
+        states = tl.load(state_comm_ptrs[1] + state_comm_offsets + comm_parity * stride_state_comm_db, mask=offs_m < dim, other=0.0).to(tl.float32)
+
+    _compute_outputs(states, states_ptrs, dA_cs_ptr, initstates_ptrs, out_ptrs, final_states_ptrs, offs_m, dim, nchunks, stride_states_chunk, stride_dA_cs_chunk, stride_out_chunk, HAS_INITSTATES, BLOCK_SIZE)
+
+@triton.jit
+def _state_passing_fwd_kernel_with_cp_dist_oneshot_all_gather(
+    # Pointers to matrices
+    state_comm_ptrs,
+    states_ptr, out_ptr, final_states_ptr, dA_cs_ptr, initstates_ptr, seq_idx_ptr,
+    signal_pad_ptrs,
+    dA_comm_ptrs,
+    # Matrix dimensions
+    dim, nchunks, seqlen, chunk_size,
+    # Strides
+    stride_states_batch, stride_states_chunk, stride_states_head, stride_states_dim,
+    stride_out_batch, stride_out_chunk, stride_out_head, stride_out_dim,
+    stride_final_states_batch, stride_final_states_head, stride_final_states_dim,
+    stride_dA_cs_batch, stride_dA_cs_chunk, stride_dA_cs_head,
+    stride_initstates_batch, stride_initstates_head, stride_initstates_dim,
+    stride_seq_idx_batch, stride_seq_idx_seqlen,
+    stride_state_comm_db, stride_state_comm_batch, stride_state_comm_head, stride_state_comm_dim,
+    stride_dA_comm_db, stride_dA_comm_block, stride_dA_comm_batch, stride_dA_comm_head,
+    # distributed parameters
+    rank: tl.constexpr,
+    # Meta-parameters
+    WORLD_SIZE_BITS: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
+    HAS_INITSTATES: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid_b = tl.program_id(axis=1)
+    pid_h = tl.program_id(axis=2)
+    pid_m = tl.program_id(axis=0)
+    states_ptr += pid_b * stride_states_batch + pid_h * stride_states_head
+    dA_cs_ptr += pid_b * stride_dA_cs_batch + pid_h * stride_dA_cs_head
+    out_ptr += pid_b * stride_out_batch + pid_h * stride_out_head
+    final_states_ptr += pid_b * stride_final_states_batch + pid_h * stride_final_states_head
+    if HAS_INITSTATES:
+        initstates_ptr += pid_b * stride_initstates_batch + pid_h * stride_initstates_head
+    state_comm_offsets = pid_b * stride_state_comm_batch + pid_h * stride_state_comm_head
+    dA_comm_offsets = pid_b * stride_dA_comm_batch + pid_h * stride_dA_comm_head
+
+    # if HAS_SEQ_IDX:
+    #     seq_idx_ptr += pid_b * stride_seq_idx_batch
+
+    offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    states_ptrs = states_ptr + offs_m * stride_states_dim
+    out_ptrs = out_ptr + offs_m * stride_out_dim
+    final_states_ptrs = final_states_ptr + offs_m * stride_final_states_dim
+    dA_comm_offsets += pid_m * stride_dA_comm_block
+    state_comm_offsets += offs_m * stride_state_comm_dim
+    initstates_ptrs = initstates_ptr + offs_m * stride_initstates_dim
+
+    states, dA_sum = _compute_final_states(states_ptrs, dA_cs_ptr, initstates_ptrs, offs_m, dim, nchunks, stride_states_chunk, stride_dA_cs_chunk, HAS_INITSTATES, BLOCK_SIZE)
+
+    # store the local states at the end of the reduction to the communication buffer
+    # we don't use a mask because this is intermediate data
+
+    comm_parity = 0
+
+    tl.store(state_comm_ptrs[0] + state_comm_offsets + comm_parity * stride_state_comm_db, states, mask=offs_m < dim)
+    tl.store(dA_comm_ptrs[0] + dA_comm_offsets + comm_parity * stride_dA_comm_db, dA_sum)
+
+    ptx_utils.symm_mem_sync(
+        signal_pad_ptrs, None, rank, WORLD_SIZE, hasSubsequentMemAccess=True
+    )
+
+    # then, do the parallel scan to reduce the values together
+    for shift in tl.static_range(1, WORLD_SIZE_BITS + 1):
+        state_comm_ptr = state_comm_ptrs[shift]
+        if state_comm_ptr is not None:
+            scale = tl.exp(dA_sum)
+            peer_states = tl.load(state_comm_ptr + state_comm_offsets + comm_parity * stride_state_comm_db, mask=offs_m < dim, other=0.0)
+
+            states = peer_states * scale + states
+            dA_sum += tl.load(dA_comm_ptrs[shift] + dA_comm_offsets + comm_parity * stride_dA_comm_db)
+
+        tl.store(state_comm_ptrs[0] + state_comm_offsets + (1 - comm_parity) * stride_state_comm_db, states, mask=offs_m < dim)
+        tl.store(dA_comm_ptrs[0] + dA_comm_offsets + (1 - comm_parity) * stride_dA_comm_db, dA_sum)
+
+        ptx_utils.symm_mem_sync(
+            signal_pad_ptrs, None, rank, WORLD_SIZE, hasPreviousMemAccess=True, hasSubsequentMemAccess=True
+        )
+
+        comm_parity = 1 - comm_parity
+
+    # finally, redo the chunk-wise computation to write the outputs
+
+    # load the state, either from initial states or from the communication buffer
+    if rank == 0:
+        if not HAS_INITSTATES:
+            states = tl.zeros((BLOCK_SIZE, ), dtype=tl.float32)
+        else:
+            initstates_ptrs = initstates_ptr + offs_m * stride_initstates_dim
+            states = tl.load(initstates_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
+    else:
+        # load from the previous computed total state
+        states = tl.load(state_comm_ptrs[1] + state_comm_offsets + comm_parity * stride_state_comm_db, mask=offs_m < dim, other=0.0).to(tl.float32)
+
+    _compute_outputs(states, states_ptrs, dA_cs_ptr, initstates_ptrs, out_ptrs, final_states_ptrs, offs_m, dim, nchunks, stride_states_chunk, stride_dA_cs_chunk, stride_out_chunk, HAS_INITSTATES, BLOCK_SIZE)
+
+
+@triton.jit
+def _compute_final_states(
+    states_ptrs, dA_cs_ptr, initstates_ptrs, offs_m, 
+    dim, nchunks, 
+    stride_states_chunk, stride_dA_cs_chunk, 
+    HAS_INITSTATES: tl.constexpr, BLOCK_SIZE: tl.constexpr
+):
+    if not HAS_INITSTATES:
+        states = tl.zeros((BLOCK_SIZE, ), dtype=tl.float32)
+    else:
+        states = tl.load(initstates_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
+
+    # seq_idx = 0
+
+    # our monoid is over pairs (state, dA_sum)
+    # the update function is
+    # (s1, a1) o (s2, a2) = (exp(a2) * s1 + s2, a1 + a2)
+
+    dA_sum = tl.zeros((), dtype=tl.float32)
+
+    # first, compute the final chunk value
+    for c in range(nchunks):
+        new_states = tl.load(states_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
+        dA_cs = tl.load(dA_cs_ptr).to(tl.float32)
+        dA_sum += dA_cs
+        scale = tl.exp(dA_cs)
+        # if HAS_SEQ_IDX:
+        #     seq_idx_new = tl.load(seq_idx_ptr + (min((c + 1) * chunk_size, seqlen) - 1) * stride_seq_idx_seqlen)
+        #     scale = tl.where(seq_idx_new == seq_idx, scale, 0.0)
+        #     seq_idx = seq_idx_new
+        states = scale * states + new_states
+        states_ptrs += stride_states_chunk
+        dA_cs_ptr += stride_dA_cs_chunk
+
+    return states, dA_sum
+
+@triton.jit
+def _compute_outputs(
+    states,
+    states_ptrs, dA_cs_ptr, initstates_ptrs, out_ptrs, final_states_ptrs, offs_m,
+    dim, nchunks, 
+    stride_states_chunk, stride_dA_cs_chunk, stride_out_chunk,
+    HAS_INITSTATES: tl.constexpr, BLOCK_SIZE: tl.constexpr
+):
+    tl.store(out_ptrs, states, mask=offs_m < dim)
+    out_ptrs += stride_out_chunk
+
+    for c in range(nchunks):
+        new_states = tl.load(states_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
+        dA_cs = tl.load(dA_cs_ptr).to(tl.float32)
+        scale = tl.exp(dA_cs)
+        # if HAS_SEQ_IDX:
+        #     seq_idx_new = tl.load(seq_idx_ptr + (min((c + 1) * chunk_size, seqlen) - 1) * stride_seq_idx_seqlen)
+        #     scale = tl.where(seq_idx_new == seq_idx, scale, 0.0)
+        #     seq_idx = seq_idx_new
+        states = scale * states + new_states
+        if c < nchunks - 1:
+            tl.store(out_ptrs, states, mask=offs_m < dim)
+        else:
+            tl.store(final_states_ptrs, states, mask=offs_m < dim)
+        states_ptrs += stride_states_chunk
+        dA_cs_ptr += stride_dA_cs_chunk
+        out_ptrs += stride_out_chunk
+
 @triton.jit
 def _state_passing_fwd_kernel_with_cp_dist(
     # Pointers to matrices

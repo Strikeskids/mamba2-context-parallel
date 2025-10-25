@@ -58,3 +58,9 @@ Remaining bugs:
 2. Hangs when you don't pass the mask in store
 3. If you pass the mask in store, you need to pass the mask in load
 4. Refactored the tensor indices to be by-rank to by-use and forgot to remove the "rank" index
+
+
+Weird stuff:
+1. Doing a persistent kernel with BLOCKS = NUM_SMS is really slow. If I increase
+    to BLOCKS=NUM_SUMS * 4, it almost returns to the same speed as the
+    non-persistent kernel
