@@ -50,3 +50,11 @@ nvshmem_barrier /warp/block
 
 NVSHMEM_IBGDA_ENABLE
 + transport uses IBGDA instead of IBRC
+
+
+Remaining bugs:
+
+1. Bad tolerance in the test
+2. Hangs when you don't pass the mask in store
+3. If you pass the mask in store, you need to pass the mask in load
+4. Refactored the tensor indices to be by-rank to by-use and forgot to remove the "rank" index
